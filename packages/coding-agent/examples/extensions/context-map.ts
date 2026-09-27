@@ -181,7 +181,8 @@ function buildMap(
 	}
 
 	for (const c of categories.values()) {
-		c.tokens = c.entries.reduce((sum, entry) => sum + entry.tokens, 0);
+		// System accumulates tokens directly and has no entries; do not clobber it.
+		if (c.entries.length > 0) c.tokens = c.entries.reduce((sum, entry) => sum + entry.tokens, 0);
 	}
 
 	// Promote dominant non-built-in tools out of the "other" bucket.
@@ -236,6 +237,10 @@ function buildMap(
 }
 
 type Row = { kind: "category"; cat: Category } | { kind: "entry"; entry: MapEntry; trimmable: boolean };
+
+/** Exported for tests. */
+export { buildMap, ContextMapComponent };
+export type { Category, ContextMap, MapEntry };
 
 class ContextMapComponent implements Focusable {
 	readonly width = 78;
@@ -432,9 +437,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			const before = pending.size;
 			const refreshMap = () => buildMap(ctx.sessionManager, ctx.getContextUsage(), pending);
-			await ctx.ui.custom<void>((_tui, theme) => new ContextMapComponent(theme, refreshMap, pending, () => {}), {
-				overlay: true,
-			});
+			// The factory's 4th argument is pi's close callback; pass it through so
+			// Escape actually dismisses the overlay and resolves the custom() promise.
+			await ctx.ui.custom<void>(
+				(_tui, theme, _keybindings, done) => new ContextMapComponent(theme, refreshMap, pending, done),
+				{ overlay: true },
+			);
 			if (pending.size !== before && pending.size > 0) {
 				ctx.ui.notify(`${pending.size} trim(s) pending; applied at the end of the next turn`, "info");
 			}
