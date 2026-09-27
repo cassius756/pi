@@ -66,6 +66,8 @@ interface ContextMap {
 	total: number;
 	/** Multiplier aligning char-based estimates with provider-reported usage; 1 when unavailable. */
 	scale: number;
+	/** Active model context window, when known. */
+	contextWindow: number | undefined;
 }
 
 /** Truecolor category palette; chrome uses theme tokens. */
@@ -106,10 +108,13 @@ function jsonChars(value: unknown): number {
 
 /** Char-based token estimate that also tolerates custom agent message roles. */
 function messageTokens(m: Message): number {
-	if (m.role === "system" || m.role === "user" || m.role === "toolResult" || Array.isArray(m.content)) {
+	try {
 		return estimateMessageTokens(m);
+	} catch {
+		// Custom roles can carry blocks the standard estimator cannot iterate
+		// (e.g. no `name` field) or non-iterable content; fall back to JSON size.
+		return Math.ceil(jsonChars(m) / 4);
 	}
-	return Math.ceil(jsonChars(m) / 4);
 }
 
 /** First printable line of a message's content, for entry labels. */
@@ -219,15 +224,14 @@ function buildMap(
 		c.tokens *= scale;
 		for (const entry of c.entries) entry.tokens *= scale;
 		c.entries.sort((a, b) => b.tokens - a.tokens);
-		if (c.expandable) {
-			c.tokens -= c.entries.filter((entry) => pending.has(entry.id)).reduce((sum, entry) => sum + entry.tokens, 0);
-		}
+		c.tokens -= c.entries.filter((entry) => pending.has(entry.id)).reduce((sum, entry) => sum + entry.tokens, 0);
 	}
 
 	return {
 		categories: [...categories.values()].filter((c) => c.tokens > 0).sort((a, b) => b.tokens - a.tokens),
 		total: [...categories.values()].reduce((sum, c) => sum + c.tokens, 0),
 		scale,
+		contextWindow: usage?.contextWindow,
 	};
 }
 
@@ -243,25 +247,27 @@ class ContextMapComponent implements Focusable {
 	private theme: Theme;
 	private map: ContextMap;
 	private pending: Set<string>;
-	private contextWindow: number | undefined;
+	private refreshMap: () => ContextMap;
 	private done: () => void;
 
-	constructor(
-		theme: Theme,
-		map: ContextMap,
-		pending: Set<string>,
-		contextWindow: number | undefined,
-		done: () => void,
-	) {
+	constructor(theme: Theme, refreshMap: () => ContextMap, pending: Set<string>, done: () => void) {
 		this.theme = theme;
-		this.map = map;
+		this.refreshMap = refreshMap;
+		this.map = refreshMap();
 		this.pending = pending;
-		this.contextWindow = contextWindow;
 		this.done = done;
 		this.rebuildRows();
 	}
 
+	/** Stable identity of the selected row, so refreshes that re-sort keep the cursor in place. */
+	private selectionKey(): string | undefined {
+		const row = this.rows[this.selected];
+		if (!row) return undefined;
+		return row.kind === "category" ? `cat:${row.cat.key}` : `entry:${row.entry.id}`;
+	}
+
 	private rebuildRows(): void {
+		const focus = this.selectionKey();
 		this.rows = [];
 		for (const c of this.map.categories) {
 			this.rows.push({ kind: "category", cat: c });
@@ -270,6 +276,13 @@ class ContextMapComponent implements Focusable {
 					this.rows.push({ kind: "entry", entry, trimmable: entry.toolName !== undefined });
 				}
 			}
+		}
+		this.selected = 0;
+		if (focus) {
+			const idx = this.rows.findIndex((r) =>
+				r.kind === "category" ? `cat:${r.cat.key}` === focus : `entry:${r.entry.id}` === focus,
+			);
+			if (idx >= 0) this.selected = idx;
 		}
 		this.selected = Math.min(this.selected, Math.max(0, this.rows.length - 1));
 	}
@@ -301,6 +314,9 @@ class ContextMapComponent implements Focusable {
 			if (row?.kind === "entry" && row.trimmable) {
 				if (this.pending.has(row.entry.id)) this.pending.delete(row.entry.id);
 				else this.pending.add(row.entry.id);
+				// Rebuild so bar, totals, and legend stay the live post-trim projection.
+				this.map = this.refreshMap();
+				this.rebuildRows();
 			}
 		}
 	}
@@ -313,13 +329,13 @@ class ContextMapComponent implements Focusable {
 		const lines: string[] = [];
 		const total = Math.max(1, this.map.total);
 
-		const fill = this.contextWindow ? `${((this.map.total / this.contextWindow) * 100).toFixed(0)}%` : "?";
+		const fill = this.map.contextWindow ? `${((this.map.total / this.map.contextWindow) * 100).toFixed(0)}%` : "?";
 		const trimNote = this.pending.size > 0 ? th.fg("warning", ` ⌫${this.pending.size} pending`) : "";
 		const calib = this.map.scale === 1 ? th.fg("dim", " est") : "";
 		lines.push(th.fg("border", `╭${"─".repeat(innerW)}╮`));
 		lines.push(
 			row(
-				` ${th.fg("accent", "Context Map")}  ${fmtK(this.map.total)}${calib} / ${this.contextWindow ? fmtK(this.contextWindow) : "?"} tokens (${fill})${trimNote}`,
+				` ${th.fg("accent", "Context Map")}  ${fmtK(this.map.total)}${calib} / ${this.map.contextWindow ? fmtK(this.map.contextWindow) : "?"} tokens (${fill})${trimNote}`,
 			),
 		);
 		lines.push(row(""));
@@ -415,20 +431,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const before = pending.size;
-			const usage = ctx.getContextUsage();
-			await ctx.ui.custom<void>(
-				(_tui, theme) =>
-					new ContextMapComponent(
-						theme,
-						buildMap(ctx.sessionManager, usage, pending),
-						pending,
-						usage?.contextWindow,
-						() => {},
-					),
-				{ overlay: true },
-			);
-			if (pending.size > before) {
-				ctx.ui.notify(`${pending.size} trim(s) queued; applied at end of next turn`, "info");
+			const refreshMap = () => buildMap(ctx.sessionManager, ctx.getContextUsage(), pending);
+			await ctx.ui.custom<void>((_tui, theme) => new ContextMapComponent(theme, refreshMap, pending, () => {}), {
+				overlay: true,
+			});
+			if (pending.size !== before && pending.size > 0) {
+				ctx.ui.notify(`${pending.size} trim(s) pending; applied at the end of the next turn`, "info");
 			}
 		},
 	});
