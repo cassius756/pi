@@ -70,6 +70,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `summarize.ts` | Summarize conversation with GPT-5.2 and show in transient UI |
 | `custom-footer.ts` | Custom footer with git branch and token stats via `ctx.ui.setFooter()` |
 | `agent-vitals.ts` | Live vitals HUD footer: context battery with compact-zone flag, self-calibrating throughput sparkline, cache hit rate, and session cost |
+| `context-map.ts` | Context window disk-usage analyzer: stacked bar by category, expandable entries, surgical tool-output trims via `context_edit` drafts at the `turn_end` boundary |
 | `custom-header.ts` | Custom header via `ctx.ui.setHeader()` |
 | `overlay-test.ts` | Test overlay compositing with inline text inputs and edge cases |
 | `overlay-qa-tests.ts` | Comprehensive overlay QA tests: anchors, margins, stacking, overflow, animation |
